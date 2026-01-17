@@ -22,6 +22,7 @@ const char* mqtt_user   = "EVEAndroid01";
 const char* mqtt_pass   = "Abracadabra@2025";
 
 // Topic (uguali al tuo ESP32 sensori)
+// Topic
 const char* TOPIC_T       = "progetto/EVE/temperatura";
 const char* TOPIC_H       = "progetto/EVE/umidita";
 const char* TOPIC_S       = "progetto/EVE/suolo";
