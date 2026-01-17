@@ -21,16 +21,23 @@ const int   mqtt_port   = 8883;
 const char* mqtt_user   = "EVEAndroid01";
 const char* mqtt_pass   = "Abracadabra@2025";
 
-// Topic (uguali al tuo ESP32 sensori)
+// Topic telemetria (pubblicati dal C3 verso broker)
 const char* TOPIC_T       = "progetto/EVE/temperatura";
 const char* TOPIC_H       = "progetto/EVE/umidita";
 const char* TOPIC_S       = "progetto/EVE/suolo";
 const char* TOPIC_BATT    = "progetto/EVE/batteria";
+
+// Topic comandi (arrivano dall’app al C3 via MQTT)
 const char* TOPIC_CMD     = "progetto/EVE/irrigazione";
-const char* TOPIC_STATUS  = "progetto/EVE/esp/status";
 const char* TOPIC_RELE1   = "progetto/EVE/rele1";
 const char* TOPIC_RELE2   = "progetto/EVE/rele2";
 const char* TOPIC_RELE3   = "progetto/EVE/rele3";
+
+// Topic stato C3 su broker
+const char* TOPIC_STATUS  = "progetto/EVE/esp/status";
+
+// >>> Topic LIVE dall'app (quello che ti interessa testare) <<<
+const char* TOPIC_LIVE    = "progetto/EVE/app/live";   // payload ON / OFF
 
 // ================== TFT (GC9A01A) ==================
 #define PIN_SCK  4
@@ -42,7 +49,6 @@ const char* TOPIC_RELE3   = "progetto/EVE/rele3";
 Adafruit_GC9A01A tft(PIN_CS, PIN_DC, PIN_RST);
 GFXcanvas16 canvas(240, 240);
 
-// ===== COLORI =====
 #define BLACK 0x0000
 #define WHITE 0xFFFF
 #define BLUE  0x001F
@@ -50,7 +56,7 @@ GFXcanvas16 canvas(240, 240);
 // ================== ESP-NOW CONFIG ==================
 static const uint8_t ESPNOW_CHANNEL = 1;
 
-// ================== PACKET TELEMETRIA ==================
+// ================== PACKETS ==================
 typedef struct __attribute__((packed)) {
   float t;
   float h;
@@ -61,7 +67,6 @@ typedef struct __attribute__((packed)) {
   uint32_t ms;
 } TelemetryPacket;
 
-// ================== PACKET COMANDI (C3 -> slave) ==================
 typedef struct __attribute__((packed)) {
   uint8_t type;      // 1 = comando
   uint8_t r1;        // 0/1 oppure 255 = ignorare
@@ -81,12 +86,18 @@ uint8_t BCAST_MAC[] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
 WiFiClientSecure wifiClient;
 PubSubClient mqtt(wifiClient);
 
-// ================== RX STATE ==================
+// ================== ESP-NOW RX STATE ==================
 volatile bool hasPkt = false;
 TelemetryPacket rx;
 TelemetryPacket viewPkt;
 unsigned long lastPktAt = 0;
 volatile uint32_t rxCount = 0;
+
+// ================== LIVE DEBUG STATE ==================
+bool liveCmdOn = false;
+unsigned long lastLiveCmdAt = 0;
+String lastMqttTopic = "";
+String lastMqttPayload = "";
 
 // ================== OCCHI UI ==================
 struct Eye { float cx, cy; float w, h; };
@@ -105,7 +116,6 @@ void scheduleBlink() { nextBlink = millis() + random(2000, 5000); }
 
 void drawEye(const Eye& e, float lx, float ly, float blinkAmt) {
   float open = 1.0f - blinkAmt;
-
   float ew = e.w;
   float eh = e.h * open;
 
@@ -141,7 +151,6 @@ String makeClientId() {
 // ================== ESP-NOW RX CALLBACK ==================
 void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
   rxCount++;
-
   if (len == (int)sizeof(TelemetryPacket)) {
     memcpy((void*)&rx, data, sizeof(TelemetryPacket));
     hasPkt = true;
@@ -149,9 +158,8 @@ void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
   }
 }
 
-// ================== ESP-NOW INIT ==================
 bool initEspNow() {
-  // WiFi stack deve essere up
+  // Assicura WiFi stack up
   esp_wifi_start();
 
   // forza canale fisso
@@ -181,7 +189,6 @@ void sendCommandToSlave(uint8_t r1, uint8_t r2, uint8_t r3, uint8_t irrig) {
   cmd.irrig = irrig;
   cmd.ms = millis();
 
-  // invio broadcast: lo slave accetta SOLO se mac mittente == MAC del C3
   esp_now_send(BCAST_MAC, (uint8_t*)&cmd, sizeof(cmd));
 }
 
@@ -191,17 +198,41 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   msg.reserve(length);
   for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
 
+  // salva ultimo messaggio visto (per debug su display)
+  lastMqttTopic = String(topic);
+  lastMqttPayload = msg;
+
+  // stampa SEMPRE tutto
+  Serial.print("[MQTT IN] topic='");
+  Serial.print(topic);
+  Serial.print("' payload='");
+  Serial.print(msg);
+  Serial.println("'");
+
   String t(topic);
 
-  if (t == TOPIC_CMD && msg == "ON") {
-    // comando irrigazione (solo overlay; se vuoi anche relè, fallo lato slave)
+  // robustezza (spazi/newline)
+  msg.trim();
+
+  // ===== LIVE ON/OFF =====
+  if (t == TOPIC_LIVE) {
+    liveCmdOn = msg.equalsIgnoreCase("ON");
+    lastLiveCmdAt = millis();
+    Serial.print(">>> LIVE CMD parsed = ");
+    Serial.println(liveCmdOn ? "ON" : "OFF");
+    return;
+  }
+
+  // ===== irrigazione =====
+  if (t == TOPIC_CMD && msg.equalsIgnoreCase("ON")) {
     sendCommandToSlave(CMD_KEEP, CMD_KEEP, CMD_KEEP, 1);
     return;
   }
 
-  if (t == TOPIC_RELE1) sendCommandToSlave(msg == "ON" ? 1 : 0, CMD_KEEP, CMD_KEEP, 0);
-  else if (t == TOPIC_RELE2) sendCommandToSlave(CMD_KEEP, msg == "ON" ? 1 : 0, CMD_KEEP, 0);
-  else if (t == TOPIC_RELE3) sendCommandToSlave(CMD_KEEP, CMD_KEEP, msg == "ON" ? 1 : 0, 0);
+  // ===== relè =====
+  if (t == TOPIC_RELE1) sendCommandToSlave(msg.equalsIgnoreCase("ON") ? 1 : 0, CMD_KEEP, CMD_KEEP, 0);
+  else if (t == TOPIC_RELE2) sendCommandToSlave(CMD_KEEP, msg.equalsIgnoreCase("ON") ? 1 : 0, CMD_KEEP, 0);
+  else if (t == TOPIC_RELE3) sendCommandToSlave(CMD_KEEP, CMD_KEEP, msg.equalsIgnoreCase("ON") ? 1 : 0, 0);
 }
 
 void connectWiFi() {
@@ -215,6 +246,13 @@ void connectWiFi() {
     Serial.print('.');
   }
   Serial.println(WiFi.status() == WL_CONNECTED ? " OK" : " KO");
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("WiFi channel: ");
+    Serial.println(WiFi.channel());
+  }
 }
 
 void connectMQTTNonBloccante() {
@@ -242,12 +280,19 @@ void connectMQTTNonBloccante() {
     Serial.println("OK");
     backoff = 0;
 
+    // subscribe specifici
     mqtt.subscribe(TOPIC_CMD);
     mqtt.subscribe(TOPIC_RELE1);
     mqtt.subscribe(TOPIC_RELE2);
     mqtt.subscribe(TOPIC_RELE3);
+    mqtt.subscribe(TOPIC_LIVE);
+
+    // >>> DEBUG: subscribe a tutto sotto progetto/EVE <<<
+    mqtt.subscribe("progetto/EVE/#");
 
     mqtt.publish(TOPIC_STATUS, "online", true);
+
+    Serial.println("SUB OK: progetto/EVE/# + topic specifici");
   } else {
     Serial.print("KO rc=");
     Serial.println(mqtt.state());
@@ -295,28 +340,47 @@ void drawOverlay(const TelemetryPacket& p, bool linkOk) {
   canvas.print("RX: ");
   canvas.print((unsigned long)rxCount);
 
-  if (WiFi.status() == WL_CONNECTED) {
-    canvas.setCursor(10, 60);
-    canvas.print("RSSI: ");
-    canvas.print(WiFi.RSSI());
+  // LIVE ON/OFF
+  canvas.setCursor(10, 60);
+  canvas.print("LIVE: ");
+  canvas.print(liveCmdOn ? "ON" : "OFF");
+
+  canvas.setCursor(10, 70);
+  canvas.print("LIVE age: ");
+  if (lastLiveCmdAt == 0) canvas.print("-");
+  else {
+    canvas.print((unsigned long)((millis() - lastLiveCmdAt) / 1000));
+    canvas.print("s");
   }
 
+  // ultimo mqtt visto
+  canvas.setCursor(10, 80);
+  canvas.print("Last: ");
+  if (lastMqttTopic.length() == 0) {
+    canvas.print("-");
+  } else {
+    // taglia per non uscire dallo schermo
+    String t = lastMqttTopic;
+    if (t.length() > 24) t = t.substring(t.length() - 24);
+    canvas.print(t);
+  }
+ 
+  // valori telemetria
   canvas.setTextSize(2);
-
-  canvas.setCursor(10, 85);
+  canvas.setCursor(10, 110);
   canvas.printf("T %.1fC", p.t);
 
-  canvas.setCursor(10, 110);
+  canvas.setCursor(10, 135);
   canvas.printf("H %d%%", (int)(p.h + 0.5f));
 
-  canvas.setCursor(10, 135);
+  canvas.setCursor(10, 160);
   canvas.printf("S %d%%", p.soil);
 
-  canvas.setCursor(10, 160);
+  canvas.setCursor(10, 185);
   canvas.printf("B %d%%", p.batt);
 
   canvas.setTextSize(1);
-  canvas.setCursor(10, 185);
+  canvas.setCursor(10, 210);
   canvas.printf("R1:%d R2:%d R3:%d PIR:%d", p.r1, p.r2, p.r3, p.presence);
 }
 
@@ -325,15 +389,15 @@ void setup() {
   randomSeed(esp_random());
 
   Serial.begin(115200);
-  delay(1200);
+  delay(800);
 
   Serial.print("C3 MAC: ");
   Serial.println(WiFi.macAddress());
 
+  // TFT
   SPI.begin(PIN_SCK, -1, PIN_MOSI, PIN_CS);
   tft.begin();
   tft.setRotation(0);
-
   canvas.fillScreen(BLACK);
   tft.drawRGBBitmap(0, 0, canvas.getBuffer(), 240, 240);
 
@@ -343,7 +407,7 @@ void setup() {
   mqtt.setServer(mqtt_server, mqtt_port);
   mqtt.setCallback(mqttCallback);
 
-  // ESP-NOW (canale fisso 1)
+  // ESP-NOW
   if (!initEspNow()) {
     Serial.println("ESP-NOW init FAIL");
   } else {
@@ -362,6 +426,16 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
+  // status periodico
+  static uint32_t lastStatus = 0;
+  if (now - lastStatus > 2000) {
+    lastStatus = now;
+    Serial.print("WiFi=");
+    Serial.print(WiFi.status() == WL_CONNECTED ? "OK" : "KO");
+    Serial.print(" MQTT=");
+    Serial.println(mqtt.connected() ? "OK" : "KO");
+  }
+
   // MQTT non bloccante
   if (WiFi.status() == WL_CONNECTED && !mqtt.connected()) connectMQTTNonBloccante();
   mqtt.loop();
@@ -373,7 +447,7 @@ void loop() {
     hasPkt = false;
     interrupts();
 
-    // publish appena arriva (replica comportamento vecchio)
+    // publish appena arriva
     publishTelemetry(viewPkt);
   }
 
