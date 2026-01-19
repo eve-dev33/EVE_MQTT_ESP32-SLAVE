@@ -1,80 +1,62 @@
 #include <Arduino.h>
+#include <SPI.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+
 #include <esp_now.h>
 #include <esp_wifi.h>
-#include <DHT.h>
-#include <SPI.h>
-#include <U8g2lib.h>
 
-// ================== PIN ==================
-#define DHTPIN   19
-#define DHTTYPE  DHT22
-#define SOIL_PIN 32
+#include <Adafruit_GFX.h>
+#include <Adafruit_GC9A01A.h>
 
-#define BATT_PIN 34
+// ================== CONFIG ==================
+// WiFi
+const char* ssid     = "H6645P-75235224_2.4GHz";
+const char* password = "zQ3Y7Q4RDt";
 
-#define RELAY1   25
-#define RELAY2   26
-#define RELAY3   27
+// MQTT (HiveMQ Cloud)
+const char* mqtt_server = "345aa86858ae4b6d8df7851ca6cfafbf.s1.eu.hivemq.cloud";
+const int   mqtt_port   = 8883;
+const char* mqtt_user   = "EVEAndroid01";
+const char* mqtt_pass   = "Abracadabra@2025";
 
-#define PRESENCE_PIN 33
-const bool PRESENCE_ACTIVE_HIGH = true;
-const unsigned long PRESENCE_TIMEOUT_MS = 45000;  // 45s
+// Topic telemetria (pubblicati dal C3 verso broker)
+const char* TOPIC_T       = "progetto/EVE/temperatura";
+const char* TOPIC_H       = "progetto/EVE/umidita";
+const char* TOPIC_S       = "progetto/EVE/suolo";
+const char* TOPIC_BATT    = "progetto/EVE/batteria";
 
-// ================== DISPLAY SH1106 SPI ==================
-static const int PIN_SCK  = 18;
-static const int PIN_MOSI = 23;
-static const int PIN_CS   = 5;
-static const int PIN_DC   = 16;
-static const int PIN_RST  = 4;
+// Topic comandi (arrivano dall’app al C3 via MQTT)
+const char* TOPIC_CMD     = "progetto/EVE/irrigazione";
+const char* TOPIC_RELE1   = "progetto/EVE/rele1";
+const char* TOPIC_RELE2   = "progetto/EVE/rele2";
+const char* TOPIC_RELE3   = "progetto/EVE/rele3";
+
+// Topic stato C3 su broker
+const char* TOPIC_STATUS  = "progetto/EVE/esp/status";
+
+// Topic LIVE dall'app
+const char* TOPIC_LIVE    = "progetto/EVE/app/live";   // payload ON / OFF
+
+// ================== TFT (GC9A01A) ==================
+#define PIN_SCK  4
+#define PIN_MOSI 6
+#define PIN_CS   7
+#define PIN_DC   10
+#define PIN_RST  1
+
+Adafruit_GC9A01A tft(PIN_CS, PIN_DC, PIN_RST);
+GFXcanvas16 canvas(240, 240);
+
+#define BLACK 0x0000
+#define WHITE 0xFFFF
+#define BLUE  0x001F
 
 // ================== ESP-NOW CONFIG ==================
-// MAC C3: 0C:4E:A0:30:37:20
-uint8_t C3_MAC[] = { 0x0C, 0x4E, 0xA0, 0x30, 0x37, 0x20 };
+uint8_t espnowChannel = 1; // verrà impostato dopo il WiFi
 
-// ================== AUTO CHANNEL (RTC) ==================
-RTC_DATA_ATTR int8_t lockedChannel = -1;   // 1..13, -1 = non ancora trovato
-
-// ===== HELLO packet (C3 -> broadcast) per discovery canale =====
-typedef struct __attribute__((packed)) {
-  uint8_t type;   // 2 = hello
-  uint8_t ch;     // canale WiFi del C3
-  uint32_t ms;
-} HelloPacket;
-
-static const uint8_t HELLO_TYPE = 2;
-
-volatile bool gotHello = false;
-volatile uint8_t helloCh = 0;
-
-// ================== BATTERY CONFIG ==================
-const float BATT_V_MIN = 3.30f;
-const float BATT_V_MAX = 4.20f;
-const int   ADC_BITS   = 12;
-
-const float BATT_R1  = 100000.0f;
-const float BATT_R2  = 100000.0f;
-const float BATT_DIV = (BATT_R1 + BATT_R2) / BATT_R2;
-
-const int   BATT_SAMPLES  = 32;
-const float BATT_ALPHA    = 0.95f;
-const int   BATT_HYST_PCT = 2;
-
-// ================== MODALITA' RISPARMIO ==================
-static const uint32_t NORMAL_WAKE_SEC = 0.5 * 60;   // 1 minuti
-static const uint32_t LIVE_WAKE_SEC   = 30;         // 30 secondi
-static const uint32_t LISTEN_WINDOW_MS_NORMAL = 20000; // ascolto comandi appena sveglio (normale)
-static const uint32_t LISTEN_WINDOW_MS_LIVE   = 6000;  // ascolto comandi (live)
-
-// Live duration: 10 minuti -> 10*60/30 = 20 cicli
-static const uint16_t LIVE_DEFAULT_SEC = 10 * 60;
-
-RTC_DATA_ATTR uint16_t liveCyclesRemaining = 0;  // persiste in deep sleep
-RTC_DATA_ATTR uint8_t  relayState1 = 0;
-RTC_DATA_ATTR uint8_t  relayState2 = 0;
-RTC_DATA_ATTR uint8_t  relayState3 = 0;
-
-// ================== PACKET TELEMETRIA ==================
+// ================== PACKETS ==================
 typedef struct __attribute__((packed)) {
   float t;
   float h;
@@ -85,458 +67,442 @@ typedef struct __attribute__((packed)) {
   uint32_t ms;
 } TelemetryPacket;
 
-TelemetryPacket pkt;
-
-// ================== PACKET COMANDI (C3 -> slave) ==================
 typedef struct __attribute__((packed)) {
   uint8_t type;      // 1 = comando
   uint8_t r1;        // 0/1 oppure 255 = ignorare
   uint8_t r2;        // 0/1 oppure 255 = ignorare
   uint8_t r3;        // 0/1 oppure 255 = ignorare
   uint8_t irrig;     // 1 = mostra IRRIGA (3s)
-  uint16_t liveSec;  // 0 = ignora, altrimenti entra in LIVE per X secondi
   uint32_t ms;
 } CommandPacket;
 
 static const uint8_t CMD_TYPE = 1;
 static const uint8_t CMD_KEEP = 255;
 
-// ================== OGGETTI ==================
-U8G2_SH1106_128X64_NONAME_F_4W_HW_SPI display(U8G2_R0, PIN_CS, PIN_DC, PIN_RST);
-DHT dht(DHTPIN, DHTTYPE);
+// ===== HELLO packet (broadcast) =====
+typedef struct __attribute__((packed)) {
+  uint8_t type;   // 2 = hello
+  uint8_t ch;     // canale wifi corrente
+  uint32_t ms;
+} HelloPacket;
 
-// ================== STATO SENSORI ==================
-float temperature = NAN;
-float humidity    = NAN;
-int   soilValue   = 0;
-int   soilPercent = 0;
-int   batteryPercent = 0;
+static const uint8_t HELLO_TYPE = 2;
 
-// Presenza/display
-unsigned long lastPresenceTime = 0;
-bool displayOn = true;
+// broadcast per inviare comandi/hello
+uint8_t BCAST_MAC[] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
 
-// UI "IRRIGA"
-bool showIrrigazione = false;
-unsigned long irrigazioneStart = 0;
+// ================== MQTT ==================
+WiFiClientSecure wifiClient;
+PubSubClient mqtt(wifiClient);
 
-// Occhi
-int leftEyeX = 40, rightEyeX = 90, eyeY = 18, eyeWidth = 35, eyeHeight = 30;
-int targetOffsetX = 0, targetOffsetY = 0, moveSpeed = 5;
-int blinkState = 0;
-unsigned long blinkDelay = 4000;
-unsigned long lastBlinkTime = 0, moveTime = 0;
+// ================== ESP-NOW RX STATE ==================
+volatile bool hasPkt = false;
+TelemetryPacket rx;
+TelemetryPacket viewPkt;
+unsigned long lastPktAt = 0;
+volatile uint32_t rxCount = 0;
 
-// ================== UTILITY DISPLAY ==================
-void showSplash(const char* line1, const char* line2 = "", int ms = 0) {
-  display.clearBuffer();
-  display.setFont(u8g2_font_ncenB08_tr);
-  if (line1 && line1[0] != '\0') display.drawStr(2, 14, line1);
-  if (line2 && line2[0] != '\0') display.drawStr(2, 30, line2);
-  display.sendBuffer();
-  if (ms > 0) delay(ms);
+// ================== LIVE DEBUG STATE ==================
+bool liveCmdOn = false;
+unsigned long lastLiveCmdAt = 0;
+String lastMqttTopic = "";
+String lastMqttPayload = "";
+
+// ================== OCCHI UI ==================
+struct Eye { float cx, cy; float w, h; };
+Eye L = { 80, 120, 70, 95 };
+Eye R = {160, 120, 70, 95 };
+
+float lookX = 0, lookY = 0;
+float targetX = 0, targetY = 0;
+
+bool blinking = false;
+uint32_t blinkStart = 0;
+uint32_t nextBlink = 0;
+
+float ease(float t) { return t * t * (3 - 2 * t); }
+void scheduleBlink() { nextBlink = millis() + random(2000, 5000); }
+
+void drawEye(const Eye& e, float lx, float ly, float blinkAmt) {
+  float open = 1.0f - blinkAmt;
+  float ew = e.w;
+  float eh = e.h * open;
+
+  canvas.fillRoundRect(
+    (int)(e.cx - ew/2),
+    (int)(e.cy - eh/2),
+    (int)ew,
+    (int)eh,
+    (int)(ew * 0.5f),
+    BLUE
+  );
+
+  float px = e.cx + lx * 18;
+  float py = e.cy + ly * 12;
+
+  canvas.fillRoundRect(
+    (int)(px - 18),
+    (int)(py - 22),
+    36,
+    44,
+    18,
+    BLACK
+  );
 }
 
-void drawEye(int x, int y, int w, int h) {
-  display.drawRBox(x, y, w, h, 5);
+String makeClientId() {
+  char id[40];
+  uint64_t mac = ESP.getEfuseMac();
+  snprintf(id, sizeof(id), "C3-%06X", (uint32_t)(mac & 0xFFFFFF));
+  return String(id);
 }
 
-void resetDisplayHardware() {
-  pinMode(PIN_CS,  OUTPUT); digitalWrite(PIN_CS, HIGH);
-  pinMode(PIN_DC,  OUTPUT); digitalWrite(PIN_DC, HIGH);
-  pinMode(PIN_RST, OUTPUT); digitalWrite(PIN_RST, HIGH);
-  delay(60);
-  digitalWrite(PIN_RST, LOW);  delay(12);
-  digitalWrite(PIN_RST, HIGH); delay(60);
-}
-
-bool initDisplayRobusto(uint8_t tentativi = 5) {
-  SPI.begin(PIN_SCK, -1, PIN_MOSI, PIN_CS);
-  for (uint8_t i = 1; i <= tentativi; i++) {
-    resetDisplayHardware();
-    display.begin();
-    display.setPowerSave(0);
-    display.setContrast(200);
-    display.setBusClock(1000000UL);
-    return true;
-  }
-  return false;
-}
-
-// ================== RELAY / PRESENZA ==================
-void setRelay(uint8_t relayPin, bool on) {
-  digitalWrite(relayPin, on ? HIGH : LOW); // active HIGH
-}
-bool readPresence() {
-  int sig = digitalRead(PRESENCE_PIN);
-  return PRESENCE_ACTIVE_HIGH ? (sig == HIGH) : (sig == LOW);
-}
-
-// ================== BATTERY ==================
-static int readBatteryPercent(float* outVBattFilt=nullptr, float* outVBattRaw=nullptr, float* outVAdc=nullptr) {
-  uint32_t sum_mv = 0;
-  analogReadMilliVolts(BATT_PIN);
-  for (int i = 0; i < BATT_SAMPLES; i++) {
-    sum_mv += analogReadMilliVolts(BATT_PIN);
-    delayMicroseconds(200);
-  }
-
-  float vAdc  = (sum_mv / (float)BATT_SAMPLES) / 1000.0f;
-  float vBattRaw = vAdc * BATT_DIV;
-
-  static float vBattFilt = 0.0f;
-  if (vBattFilt == 0.0f) vBattFilt = vBattRaw;
-  else vBattFilt = BATT_ALPHA * vBattFilt + (1.0f - BATT_ALPHA) * vBattRaw;
-
-  if (outVAdc)      *outVAdc = vAdc;
-  if (outVBattRaw)  *outVBattRaw = vBattRaw;
-  if (outVBattFilt) *outVBattFilt = vBattFilt;
-
-  float pct = (vBattFilt - BATT_V_MIN) * 100.0f / (BATT_V_MAX - BATT_V_MIN);
-  pct = constrain(pct, 0.0f, 100.0f);
-  int pctInt = (int)(pct + 0.5f);
-
-  static int lastStable = -1;
-  if (lastStable < 0) lastStable = pctInt;
-
-  if (abs(pctInt - lastStable) < BATT_HYST_PCT) pctInt = lastStable;
-  else lastStable = pctInt;
-
-  return pctInt;
-}
-
-// ================== SENSORI ==================
-void updateSensors() {
-  float t = dht.readTemperature();
-  float h = dht.readHumidity();
-  if (!isnan(t) && !isnan(h)) {
-    temperature = t;
-    humidity    = h;
-  }
-
-  soilValue   = analogRead(SOIL_PIN);
-  soilPercent = map(soilValue, 3000, 1200, 0, 100);
-  soilPercent = constrain(soilPercent, 0, 100);
-
-  batteryPercent = readBatteryPercent();
-}
-
-// ================== UI ==================
-void drawUI() {
-  static int offsetX = 0, offsetY = 0;
-  unsigned long now = millis();
-
-  if (showIrrigazione) {
-    if (now - irrigazioneStart < 3000) {
-      display.clearBuffer();
-      display.setFont(u8g2_font_ncenB14_tr);
-      display.setCursor(10, 35);
-      display.print("IRRIGA");
-      display.sendBuffer();
-      return;
-    } else {
-      showIrrigazione = false;
-    }
-  }
-
-  if (now - lastBlinkTime > blinkDelay && blinkState == 0) {
-    blinkState = 1; lastBlinkTime = now;
-  } else if (blinkState == 1 && now - lastBlinkTime > 150) {
-    blinkState = 0; lastBlinkTime = now;
-  }
-
-  if (blinkState == 0 && now - moveTime > (unsigned long)random(1500, 3000)) {
-    int m = random(0, 8);
-    switch (m) {
-      case 0: targetOffsetX=-10; targetOffsetY=0; break;
-      case 1: targetOffsetX= 10; targetOffsetY=0; break;
-      case 2: targetOffsetX=-10; targetOffsetY=-8; break;
-      case 3: targetOffsetX= 10; targetOffsetY=-8; break;
-      case 4: targetOffsetX=-10; targetOffsetY= 8; break;
-      case 5: targetOffsetX= 10; targetOffsetY= 8; break;
-      default: targetOffsetX=0; targetOffsetY=0; break;
-    }
-    moveTime = now;
-  }
-
-  offsetX += (targetOffsetX - offsetX) / moveSpeed;
-  offsetY += (targetOffsetY - offsetY) / moveSpeed;
-
-  display.clearBuffer();
-
-  if (blinkState == 0) {
-    drawEye(leftEyeX + offsetX,  eyeY + offsetY, eyeWidth, eyeHeight);
-    drawEye(rightEyeX + offsetX, eyeY + offsetY, eyeWidth, eyeHeight);
-  } else {
-    display.drawBox(leftEyeX + offsetX,  eyeY + offsetY + eyeHeight/2 - 2, eyeWidth, 4);
-    display.drawBox(rightEyeX + offsetX, eyeY + offsetY + eyeHeight/2 - 2, eyeWidth, 4);
-  }
-
-  char line[24];
-  display.setFont(u8g2_font_5x8_tr);
-  snprintf(line, sizeof(line), "T: %.1fC", temperature); display.drawStr(0, 10, line);
-  snprintf(line, sizeof(line), "H: %.1f%%", humidity);    display.drawStr(0, 20, line);
-  snprintf(line, sizeof(line), "S: %d%%", soilPercent);   display.drawStr(0, 30, line);
-  snprintf(line, sizeof(line), "B: %d%%", batteryPercent);display.drawStr(0, 40, line);
-
-  display.sendBuffer();
-}
-
-void handlePresence() {
-  unsigned long now = millis();
-  bool presence = readPresence();
-  if (presence) {
-    lastPresenceTime = now;
-    if (!displayOn) { displayOn = true; display.setPowerSave(0); }
-  } else {
-    if (displayOn && (now - lastPresenceTime >= PRESENCE_TIMEOUT_MS)) {
-      displayOn = false; display.setPowerSave(1);
-    }
-  }
-}
-
-// ================== ESP-NOW ==================
-volatile esp_now_send_status_t lastSendStatus = ESP_NOW_SEND_FAIL;
-volatile bool sendDone = false;
-
-void onEspNowSent(const uint8_t* mac, esp_now_send_status_t status) {
-  lastSendStatus = status;
-  sendDone = true;
-  Serial.print("ESP-NOW sent -> ");
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
-}
-
-// RX comandi + HELLO discovery
+// ================== ESP-NOW RX CALLBACK ==================
 void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
-  // 1) HELLO (broadcast dal C3): serve solo per scoprire il canale
-  if (len == (int)sizeof(HelloPacket)) {
-    HelloPacket h;
-    memcpy(&h, data, sizeof(h));
-    if (h.type == HELLO_TYPE) {
-      gotHello = true;
-      helloCh = h.ch;
-      return;
-    }
-  }
-
-  // 2) CommandPacket (solo dal MAC del C3)
-  if (memcmp(mac, C3_MAC, 6) != 0) return;
-  if (len != (int)sizeof(CommandPacket)) return;
-
-  CommandPacket cmd;
-  memcpy(&cmd, data, sizeof(cmd));
-  if (cmd.type != CMD_TYPE) return;
-
-  if (cmd.r1 != CMD_KEEP) { relayState1 = (cmd.r1 == 1); setRelay(RELAY1, relayState1); }
-  if (cmd.r2 != CMD_KEEP) { relayState2 = (cmd.r2 == 1); setRelay(RELAY2, relayState2); }
-  if (cmd.r3 != CMD_KEEP) { relayState3 = (cmd.r3 == 1); setRelay(RELAY3, relayState3); }
-
-  if (cmd.irrig == 1) { showIrrigazione = true; irrigazioneStart = millis(); }
-
-  if (cmd.liveSec > 0) {
-    uint16_t cycles = (uint16_t)((cmd.liveSec + LIVE_WAKE_SEC - 1) / LIVE_WAKE_SEC);
-    liveCyclesRemaining = cycles;
-    Serial.print("LIVE requested sec="); Serial.print(cmd.liveSec);
-    Serial.print(" -> cycles="); Serial.println(liveCyclesRemaining);
+  rxCount++;
+  if (len == (int)sizeof(TelemetryPacket)) {
+    memcpy((void*)&rx, data, sizeof(TelemetryPacket));
+    hasPkt = true;
+    lastPktAt = millis();
   }
 }
 
-static bool initEspNowOnChannel(uint8_t ch) {
-  WiFi.mode(WIFI_STA);
-  delay(20);
-
+bool initEspNow(uint8_t ch) {
   esp_wifi_start();
-  esp_wifi_set_ps(WIFI_PS_NONE); // evita power save
+  esp_wifi_set_ps(WIFI_PS_NONE);
 
+  // allinea canale a quello del WiFi
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
 
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW init FAIL");
-    return false;
-  }
-
-  esp_now_register_send_cb(onEspNowSent);
+  if (esp_now_init() != ESP_OK) return false;
   esp_now_register_recv_cb(onEspNowRecv);
 
-  // peer unicast (C3) per telemetria con ACK
+  // peer broadcast per inviare comandi/hello
   esp_now_peer_info_t peer = {};
-  memcpy(peer.peer_addr, C3_MAC, 6);
+  memcpy(peer.peer_addr, BCAST_MAC, 6);
   peer.channel = ch;
   peer.encrypt = false;
 
-  esp_now_del_peer(C3_MAC);
-  if (esp_now_add_peer(&peer) != ESP_OK) {
-    Serial.println("ESP-NOW add_peer FAIL");
-    return false;
-  }
+  esp_now_del_peer(BCAST_MAC);
+  esp_now_add_peer(&peer);
 
-  Serial.print("ESP-NOW OK ch="); Serial.println(ch);
-  Serial.print("SENSORS MAC: "); Serial.println(WiFi.macAddress());
   return true;
 }
 
-// Scan canali 1..13 fino a ricevere HELLO dal C3
-static bool findChannelFromHello(uint32_t maxMs = 7000) {
-  gotHello = false;
+void sendCommandToSlave(uint8_t r1, uint8_t r2, uint8_t r3, uint8_t irrig) {
+  CommandPacket cmd;
+  cmd.type = CMD_TYPE;
+  cmd.r1 = r1;
+  cmd.r2 = r2;
+  cmd.r3 = r3;
+  cmd.irrig = irrig;
+  cmd.ms = millis();
 
-  uint32_t start = millis();
-  while (millis() - start < maxMs) {
-    for (uint8_t ch = 1; ch <= 13; ch++) {
-      // ascolto su canale ch
-      esp_wifi_set_promiscuous(true);
-      esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-      esp_wifi_set_promiscuous(false);
-
-      uint32_t t0 = millis();
-      while (millis() - t0 < 240) { // finestra ascolto
-        if (gotHello) {
-          lockedChannel = (int8_t)helloCh;
-          Serial.print("LOCKED CHANNEL from HELLO = ");
-          Serial.println(lockedChannel);
-          return true;
-        }
-        delay(5);
-      }
-    }
-  }
-  return false;
+  esp_now_send(BCAST_MAC, (uint8_t*)&cmd, sizeof(cmd));
 }
 
-bool sendToC3WithRetry(uint8_t tries = 3) {
-  pkt.t = temperature;
-  pkt.h = humidity;
-  pkt.soil = (uint8_t)soilPercent;
-  pkt.batt = (uint8_t)batteryPercent;
-
-  pkt.r1 = digitalRead(RELAY1) ? 1 : 0;
-  pkt.r2 = digitalRead(RELAY2) ? 1 : 0;
-  pkt.r3 = digitalRead(RELAY3) ? 1 : 0;
-
-  pkt.presence = readPresence() ? 1 : 0;
-  pkt.ms = millis();
-
-  for (uint8_t i = 0; i < tries; i++) {
-    sendDone = false;
-    esp_now_send(C3_MAC, (uint8_t*)&pkt, sizeof(pkt));
-
-    uint32_t t0 = millis();
-    while (!sendDone && millis() - t0 < 250) delay(1);
-
-    if (sendDone && lastSendStatus == ESP_NOW_SEND_SUCCESS) return true;
-    delay(35);
-  }
-  return false;
+void sendHello() {
+  HelloPacket h;
+  h.type = HELLO_TYPE;
+  h.ch   = WiFi.channel();
+  h.ms   = millis();
+  esp_now_send(BCAST_MAC, (uint8_t*)&h, sizeof(h));
 }
 
-// ================== DEEP SLEEP CONTROL ==================
-void goToSleep(bool liveMode) {
-  uint32_t sleepSec = liveMode ? LIVE_WAKE_SEC : NORMAL_WAKE_SEC;
+// ================== MQTT ==================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  msg.reserve(length);
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
 
-  Serial.print("SLEEP "); Serial.print(sleepSec);
-  Serial.print("s (liveCyclesRemaining="); Serial.print(liveCyclesRemaining);
-  Serial.println(")");
+  lastMqttTopic = String(topic);
+  lastMqttPayload = msg;
 
-  esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000ULL);
-  esp_deep_sleep_start();
+  Serial.print("[MQTT IN] topic='");
+  Serial.print(topic);
+  Serial.print("' payload='");
+  Serial.print(msg);
+  Serial.println("'");
+
+  String t(topic);
+  msg.trim();
+
+  // LIVE
+  if (t == TOPIC_LIVE) {
+    liveCmdOn = msg.equalsIgnoreCase("ON");
+    lastLiveCmdAt = millis();
+    Serial.print(">>> LIVE CMD parsed = ");
+    Serial.println(liveCmdOn ? "ON" : "OFF");
+    return;
+  }
+
+  // irrigazione
+  if (t == TOPIC_CMD && msg.equalsIgnoreCase("ON")) {
+    sendCommandToSlave(CMD_KEEP, CMD_KEEP, CMD_KEEP, 1);
+    return;
+  }
+
+  // relè
+  if (t == TOPIC_RELE1) sendCommandToSlave(msg.equalsIgnoreCase("ON") ? 1 : 0, CMD_KEEP, CMD_KEEP, 0);
+  else if (t == TOPIC_RELE2) sendCommandToSlave(CMD_KEEP, msg.equalsIgnoreCase("ON") ? 1 : 0, CMD_KEEP, 0);
+  else if (t == TOPIC_RELE3) sendCommandToSlave(CMD_KEEP, CMD_KEEP, msg.equalsIgnoreCase("ON") ? 1 : 0, 0);
 }
 
-void setup() {
-  Serial.begin(115200);
-  delay(200);
-  Serial.println("\nESP32 SENSORI (SLAVE) AVVIATO");
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
 
-  randomSeed((uint32_t)esp_random());
-
-  // Display
-  SPI.begin(PIN_SCK, -1, PIN_MOSI, PIN_CS);
-  bool ok = initDisplayRobusto();
-  if (!ok) {
-    resetDisplayHardware();
-    display.begin();
-    display.setPowerSave(0);
-    display.setContrast(200);
-    display.setBusClock(1000000UL);
+  Serial.print("WiFi: ");
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(250);
+    Serial.print('.');
   }
-  showSplash("Display OK", "Slave avvio...", 250);
+  Serial.println(WiFi.status() == WL_CONNECTED ? " OK" : " KO");
 
-  // DHT
-  dht.begin();
-
-  // ADC
-  analogReadResolution(ADC_BITS);
-  analogSetPinAttenuation(BATT_PIN, ADC_11db);
-  pinMode(BATT_PIN, INPUT);
-
-  // Relè (ripristino stato da RTC)
-  pinMode(RELAY1, OUTPUT);
-  pinMode(RELAY2, OUTPUT);
-  pinMode(RELAY3, OUTPUT);
-  setRelay(RELAY1, relayState1 == 1);
-  setRelay(RELAY2, relayState2 == 1);
-  setRelay(RELAY3, relayState3 == 1);
-
-  // PIR
-  pinMode(PRESENCE_PIN, INPUT);
-  lastPresenceTime = millis();
-  displayOn = true;
-  display.setPowerSave(0);
-
-  // ==== ESP-NOW con auto-canale ====
-  // 1) prima inizializzo ESPNOW su un canale "placeholder" (1) per poter ricevere callback HELLO durante lo scan
-  if (!initEspNowOnChannel(1)) {
-    showSplash("ESP-NOW", "Init FAIL", 800);
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("WiFi channel: ");
+    Serial.println(WiFi.channel());
   }
+}
 
-  // 2) se non abbiamo un canale lockato, facciamo scan per trovare HELLO dal C3
-  if (lockedChannel < 1 || lockedChannel > 13) {
-    showSplash("AUTO CH", "Scanning...", 0);
-    bool found = findChannelFromHello(7000);
-    if (!found) {
-      Serial.println("AUTO CH: NOT FOUND (fallback ch=1)");
-      lockedChannel = 1;
-    }
+void connectMQTTNonBloccante() {
+  static unsigned long lastAttempt = 0;
+  static uint8_t backoff = 0;
+
+  if (mqtt.connected()) return;
+
+  unsigned long now = millis();
+  if (now - lastAttempt < (1000UL << backoff)) return;
+
+  lastAttempt = now;
+  if (backoff < 5) backoff++;
+
+  String cid = makeClientId();
+  Serial.print("MQTT connect... ");
+
+  bool ok = mqtt.connect(
+    cid.c_str(),
+    mqtt_user, mqtt_pass,
+    TOPIC_STATUS, 1, true, "offline", true
+  );
+
+  if (ok) {
+    Serial.println("OK");
+    backoff = 0;
+
+    mqtt.subscribe(TOPIC_CMD);
+    mqtt.subscribe(TOPIC_RELE1);
+    mqtt.subscribe(TOPIC_RELE2);
+    mqtt.subscribe(TOPIC_RELE3);
+    mqtt.subscribe(TOPIC_LIVE);
+    mqtt.subscribe("progetto/EVE/#");
+
+    mqtt.publish(TOPIC_STATUS, "online", true);
+
+    Serial.println("SUB OK: progetto/EVE/# + topic specifici");
   } else {
-    Serial.print("AUTO CH: using lockedChannel=");
-    Serial.println(lockedChannel);
+    Serial.print("KO rc=");
+    Serial.println(mqtt.state());
+  }
+}
+
+// ================== PUBLISH TELEMETRY ==================
+void publishTelemetry(const TelemetryPacket& p) {
+  if (!mqtt.connected()) return;
+
+  char buf[32];
+
+  dtostrf(p.t, 0, 1, buf);
+  mqtt.publish(TOPIC_T, buf, true);
+
+  dtostrf(p.h, 0, 1, buf);
+  mqtt.publish(TOPIC_H, buf, true);
+
+  snprintf(buf, sizeof(buf), "%d", (int)p.soil);
+  mqtt.publish(TOPIC_S, buf, true);
+
+  snprintf(buf, sizeof(buf), "%d", (int)p.batt);
+  mqtt.publish(TOPIC_BATT, buf, true);
+}
+
+// ================== UI OVERLAY ==================
+void drawOverlay(const TelemetryPacket& p, bool linkOk) {
+  canvas.setTextColor(WHITE);
+  canvas.setTextWrap(false);
+
+  canvas.setTextSize(2);
+  canvas.setCursor(10, 10);
+  canvas.print("EVE");
+
+  canvas.setTextSize(1);
+  canvas.setCursor(10, 30);
+  canvas.print("ESP-NOW: ");
+  canvas.print(linkOk ? "OK" : "NO DATA");
+
+  canvas.setCursor(10, 40);
+  canvas.print("MQTT: ");
+  canvas.print(mqtt.connected() ? "OK" : "KO");
+
+  canvas.setCursor(10, 50);
+  canvas.print("RX: ");
+  canvas.print((unsigned long)rxCount);
+
+  canvas.setCursor(10, 60);
+  canvas.print("LIVE: ");
+  canvas.print(liveCmdOn ? "ON" : "OFF");
+
+  canvas.setCursor(10, 70);
+  canvas.print("LIVE age: ");
+  if (lastLiveCmdAt == 0) canvas.print("-");
+  else {
+    canvas.print((unsigned long)((millis() - lastLiveCmdAt) / 1000));
+    canvas.print("s");
   }
 
-  // 3) re-init ESPNOW sul canale lockato
-  esp_now_deinit();
-  delay(20);
-  initEspNowOnChannel((uint8_t)lockedChannel);
-
-  // ==== finestra ascolto comandi ====
-  bool liveMode = (liveCyclesRemaining > 0);
-  uint32_t listenWindow = liveMode ? LISTEN_WINDOW_MS_LIVE : LISTEN_WINDOW_MS_NORMAL;
-
-  Serial.print("MODE: "); Serial.println(liveMode ? "LIVE" : "NORMAL");
-
-  uint32_t t0 = millis();
-  while (millis() - t0 < listenWindow) {
-    delay(10);
+  canvas.setCursor(10, 80);
+  canvas.print("Last: ");
+  if (lastMqttTopic.length() == 0) canvas.print("-");
+  else {
+    String t = lastMqttTopic;
+    if (t.length() > 24) t = t.substring(t.length() - 24);
+    canvas.print(t);
   }
 
-  // ==== aggiorna sensori + invia ====
-  updateSensors();
-  bool txOk = sendToC3WithRetry(3);
-  Serial.println(txOk ? "TX OK" : "TX FAIL");
+  canvas.setTextSize(2);
+  canvas.setCursor(10, 110);
+  canvas.printf("T %.1fC", p.t);
 
-  // UI minima
-  handlePresence();
-  if (displayOn) {
-    drawUI();
-    delay(120);
+  canvas.setCursor(10, 135);
+  canvas.printf("H %d%%", (int)(p.h + 0.5f));
+
+  canvas.setCursor(10, 160);
+  canvas.printf("S %d%%", p.soil);
+
+  canvas.setCursor(10, 185);
+  canvas.printf("B %d%%", p.batt);
+
+  canvas.setTextSize(1);
+  canvas.setCursor(10, 210);
+  canvas.printf("R1:%d R2:%d R3:%d PIR:%d", p.r1, p.r2, p.r3, p.presence);
+}
+
+// ================== SETUP / LOOP ==================
+void setup() {
+  randomSeed(esp_random());
+
+  Serial.begin(115200);
+  delay(800);
+
+  Serial.print("C3 MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  // TFT
+  SPI.begin(PIN_SCK, -1, PIN_MOSI, PIN_CS);
+  tft.begin();
+  tft.setRotation(0);
+  canvas.fillScreen(BLACK);
+  tft.drawRGBBitmap(0, 0, canvas.getBuffer(), 240, 240);
+
+  // WiFi + MQTT
+  connectWiFi();
+  wifiClient.setInsecure();
+  mqtt.setServer(mqtt_server, mqtt_port);
+  mqtt.setCallback(mqttCallback);
+
+  // ESP-NOW sul canale del WiFi
+  espnowChannel = WiFi.channel();
+  Serial.print("WiFi channel (AP) = ");
+  Serial.println(espnowChannel);
+
+  if (!initEspNow(espnowChannel)) {
+    Serial.println("ESP-NOW init FAIL");
+  } else {
+    Serial.print("ESP-NOW RX OK (ch=");
+    Serial.print(espnowChannel);
+    Serial.println(")");
   }
 
-  // Se siamo in LIVE, consumiamo 1 ciclo
-  if (liveCyclesRemaining > 0) liveCyclesRemaining--;
+  memset((void*)&viewPkt, 0, sizeof(viewPkt));
+  viewPkt.t = NAN;
+  viewPkt.h = NAN;
 
-  // Sleep
-  goToSleep(liveCyclesRemaining > 0);
+  scheduleBlink();
 }
 
 void loop() {
-  // Non ci arriviamo: usiamo deep sleep
+  uint32_t now = millis();
+
+  // status periodico
+  static uint32_t lastStatus = 0;
+  if (now - lastStatus > 2000) {
+    lastStatus = now;
+    Serial.print("WiFi=");
+    Serial.print(WiFi.status() == WL_CONNECTED ? "OK" : "KO");
+    Serial.print(" ch=");
+    Serial.print(WiFi.channel());
+    Serial.print(" MQTT=");
+    Serial.println(mqtt.connected() ? "OK" : "KO");
+  }
+
+  // MQTT non bloccante
+  if (WiFi.status() == WL_CONNECTED && !mqtt.connected()) connectMQTTNonBloccante();
+  mqtt.loop();
+
+  // copia pacchetto ricevuto
+  if (hasPkt) {
+    noInterrupts();
+    viewPkt = rx;
+    hasPkt = false;
+    interrupts();
+
+    // publish appena arriva
+    publishTelemetry(viewPkt);
+  }
+
+  // HELLO periodico per auto-channel dei sensori
+  static uint32_t lastHello = 0;
+  if (millis() - lastHello > 1000) {
+    lastHello = millis();
+    sendHello();
+  }
+
+  // animazioni occhi
+  if (random(0, 100) < 2) {
+    targetX = random(-10, 11) / 10.0f;
+    targetY = random(-6, 7) / 10.0f;
+  }
+
+  lookX += (targetX - lookX) * 0.12f;
+  lookY += (targetY - lookY) * 0.12f;
+
+  float blinkAmt = 0.0f;
+  if (!blinking && now > nextBlink) {
+    blinking = true;
+    blinkStart = now;
+  }
+  if (blinking) {
+    float t = (now - blinkStart) / 180.0f;
+    if (t >= 1.0f) {
+      blinking = false;
+      scheduleBlink();
+    } else {
+      blinkAmt = ease(t < 0.5 ? t*2 : (1 - t)*2);
+    }
+  }
+
+  canvas.fillScreen(BLACK);
+  drawEye(L, lookX, lookY, blinkAmt);
+  drawEye(R, lookX, lookY, blinkAmt);
+
+  bool linkOk = (now - lastPktAt) <= 5000;
+  drawOverlay(viewPkt, linkOk);
+
+  tft.drawRGBBitmap(0, 0, canvas.getBuffer(), 240, 240);
+
+  delay(16);
 }
