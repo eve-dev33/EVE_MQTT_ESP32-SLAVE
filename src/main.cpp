@@ -36,7 +36,7 @@ const char* TOPIC_RELE3   = "progetto/EVE/rele3";
 // Topic stato C3 su broker
 const char* TOPIC_STATUS  = "progetto/EVE/esp/status";
 
-// >>> Topic LIVE dall'app (quello che ti interessa testare) <<<
+// Topic LIVE dall'app
 const char* TOPIC_LIVE    = "progetto/EVE/app/live";   // payload ON / OFF
 
 // ================== TFT (GC9A01A) ==================
@@ -54,7 +54,7 @@ GFXcanvas16 canvas(240, 240);
 #define BLUE  0x001F
 
 // ================== ESP-NOW CONFIG ==================
-static const uint8_t ESPNOW_CHANNEL = 1;
+uint8_t espnowChannel = 1; // verrà impostato dopo il WiFi
 
 // ================== PACKETS ==================
 typedef struct __attribute__((packed)) {
@@ -79,7 +79,16 @@ typedef struct __attribute__((packed)) {
 static const uint8_t CMD_TYPE = 1;
 static const uint8_t CMD_KEEP = 255;
 
-// broadcast per inviare comandi (lo slave filtra per MAC del C3)
+// ===== HELLO packet (broadcast) =====
+typedef struct __attribute__((packed)) {
+  uint8_t type;   // 2 = hello
+  uint8_t ch;     // canale wifi corrente
+  uint32_t ms;
+} HelloPacket;
+
+static const uint8_t HELLO_TYPE = 2;
+
+// broadcast per inviare comandi/hello
 uint8_t BCAST_MAC[] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
 
 // ================== MQTT ==================
@@ -158,23 +167,25 @@ void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
   }
 }
 
-bool initEspNow() {
-  // Assicura WiFi stack up
+bool initEspNow(uint8_t ch) {
   esp_wifi_start();
+  esp_wifi_set_ps(WIFI_PS_NONE);
 
-  // forza canale fisso
+  // allinea canale a quello del WiFi
   esp_wifi_set_promiscuous(true);
-  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
 
   if (esp_now_init() != ESP_OK) return false;
   esp_now_register_recv_cb(onEspNowRecv);
 
-  // peer broadcast per inviare comandi
+  // peer broadcast per inviare comandi/hello
   esp_now_peer_info_t peer = {};
   memcpy(peer.peer_addr, BCAST_MAC, 6);
-  peer.channel = ESPNOW_CHANNEL;
+  peer.channel = ch;
   peer.encrypt = false;
+
+  esp_now_del_peer(BCAST_MAC);
   esp_now_add_peer(&peer);
 
   return true;
@@ -192,17 +203,23 @@ void sendCommandToSlave(uint8_t r1, uint8_t r2, uint8_t r3, uint8_t irrig) {
   esp_now_send(BCAST_MAC, (uint8_t*)&cmd, sizeof(cmd));
 }
 
+void sendHello() {
+  HelloPacket h;
+  h.type = HELLO_TYPE;
+  h.ch   = WiFi.channel();
+  h.ms   = millis();
+  esp_now_send(BCAST_MAC, (uint8_t*)&h, sizeof(h));
+}
+
 // ================== MQTT ==================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String msg;
   msg.reserve(length);
   for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
 
-  // salva ultimo messaggio visto (per debug su display)
   lastMqttTopic = String(topic);
   lastMqttPayload = msg;
 
-  // stampa SEMPRE tutto
   Serial.print("[MQTT IN] topic='");
   Serial.print(topic);
   Serial.print("' payload='");
@@ -210,11 +227,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.println("'");
 
   String t(topic);
-
-  // robustezza (spazi/newline)
   msg.trim();
 
-  // ===== LIVE ON/OFF =====
+  // LIVE
   if (t == TOPIC_LIVE) {
     liveCmdOn = msg.equalsIgnoreCase("ON");
     lastLiveCmdAt = millis();
@@ -223,13 +238,13 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
-  // ===== irrigazione =====
+  // irrigazione
   if (t == TOPIC_CMD && msg.equalsIgnoreCase("ON")) {
     sendCommandToSlave(CMD_KEEP, CMD_KEEP, CMD_KEEP, 1);
     return;
   }
 
-  // ===== relè =====
+  // relè
   if (t == TOPIC_RELE1) sendCommandToSlave(msg.equalsIgnoreCase("ON") ? 1 : 0, CMD_KEEP, CMD_KEEP, 0);
   else if (t == TOPIC_RELE2) sendCommandToSlave(CMD_KEEP, msg.equalsIgnoreCase("ON") ? 1 : 0, CMD_KEEP, 0);
   else if (t == TOPIC_RELE3) sendCommandToSlave(CMD_KEEP, CMD_KEEP, msg.equalsIgnoreCase("ON") ? 1 : 0, 0);
@@ -280,14 +295,11 @@ void connectMQTTNonBloccante() {
     Serial.println("OK");
     backoff = 0;
 
-    // subscribe specifici
     mqtt.subscribe(TOPIC_CMD);
     mqtt.subscribe(TOPIC_RELE1);
     mqtt.subscribe(TOPIC_RELE2);
     mqtt.subscribe(TOPIC_RELE3);
     mqtt.subscribe(TOPIC_LIVE);
-
-    // >>> DEBUG: subscribe a tutto sotto progetto/EVE <<<
     mqtt.subscribe("progetto/EVE/#");
 
     mqtt.publish(TOPIC_STATUS, "online", true);
@@ -340,7 +352,6 @@ void drawOverlay(const TelemetryPacket& p, bool linkOk) {
   canvas.print("RX: ");
   canvas.print((unsigned long)rxCount);
 
-  // LIVE ON/OFF
   canvas.setCursor(10, 60);
   canvas.print("LIVE: ");
   canvas.print(liveCmdOn ? "ON" : "OFF");
@@ -353,19 +364,15 @@ void drawOverlay(const TelemetryPacket& p, bool linkOk) {
     canvas.print("s");
   }
 
-  // ultimo mqtt visto
   canvas.setCursor(10, 80);
   canvas.print("Last: ");
-  if (lastMqttTopic.length() == 0) {
-    canvas.print("-");
-  } else {
-    // taglia per non uscire dallo schermo
+  if (lastMqttTopic.length() == 0) canvas.print("-");
+  else {
     String t = lastMqttTopic;
     if (t.length() > 24) t = t.substring(t.length() - 24);
     canvas.print(t);
   }
- 
-  // valori telemetria
+
   canvas.setTextSize(2);
   canvas.setCursor(10, 110);
   canvas.printf("T %.1fC", p.t);
@@ -407,12 +414,16 @@ void setup() {
   mqtt.setServer(mqtt_server, mqtt_port);
   mqtt.setCallback(mqttCallback);
 
-  // ESP-NOW
-  if (!initEspNow()) {
+  // ESP-NOW sul canale del WiFi
+  espnowChannel = WiFi.channel();
+  Serial.print("WiFi channel (AP) = ");
+  Serial.println(espnowChannel);
+
+  if (!initEspNow(espnowChannel)) {
     Serial.println("ESP-NOW init FAIL");
   } else {
     Serial.print("ESP-NOW RX OK (ch=");
-    Serial.print(ESPNOW_CHANNEL);
+    Serial.print(espnowChannel);
     Serial.println(")");
   }
 
@@ -432,6 +443,8 @@ void loop() {
     lastStatus = now;
     Serial.print("WiFi=");
     Serial.print(WiFi.status() == WL_CONNECTED ? "OK" : "KO");
+    Serial.print(" ch=");
+    Serial.print(WiFi.channel());
     Serial.print(" MQTT=");
     Serial.println(mqtt.connected() ? "OK" : "KO");
   }
@@ -449,6 +462,13 @@ void loop() {
 
     // publish appena arriva
     publishTelemetry(viewPkt);
+  }
+
+  // HELLO periodico per auto-channel dei sensori
+  static uint32_t lastHello = 0;
+  if (millis() - lastHello > 1000) {
+    lastHello = millis();
+    sendHello();
   }
 
   // animazioni occhi
