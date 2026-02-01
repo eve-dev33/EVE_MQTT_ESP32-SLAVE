@@ -293,6 +293,41 @@ void handlePresence() {
       displayOn = false; display.setPowerSave(1);
     }
   }
+
+  // 2) PowerStatePacket
+  if (len == (int)sizeof(PowerStatePacket)) {
+    PowerStatePacket st;
+    memcpy(&st, data, sizeof(st));
+    if (st.type != PWR_STATE_TYPE) return;
+
+    powerRelayMask = st.relayMask;
+
+    for (int i=0; i<4; i++) {
+      bool on = (st.relayMask >> i) & 0x01;
+      mqtt.publish(PWR_RELAY_STATE[i], on ? "ON" : "OFF", true);
+    }
+
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+      "{\"relayMask\":%u,\"timeValid\":%u,\"resetReason\":%u}",
+      (unsigned)st.relayMask, (unsigned)st.timeValid, (unsigned)st.resetReason
+    );
+    mqtt.publish(PWR_STATE, buf, true);
+
+    char ev[128];
+    snprintf(ev, sizeof(ev),
+      "{\"type\":\"power_state\",\"relayMask\":%u,\"resetReason\":%u}",
+      (unsigned)st.relayMask, (unsigned)st.resetReason
+    );
+    mqtt.publish(PWR_EVENT, ev, false);
+
+    // ✅ aggiornamento immediato del LAST quando cambiano i relè (se abbiamo telemetria valida)
+    if (haveTelemetry) publishLastToMqtt(viewPkt);
+
+    return;
+  }
+
+  (void)mac;
 }
 
 // ================== ESP-NOW ==================
@@ -349,7 +384,7 @@ static bool initEspNowOnChannel(uint8_t ch) {
   esp_wifi_set_ps(WIFI_PS_NONE); // evita power save
 
   esp_wifi_set_promiscuous(true);
-  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
 
   if (esp_now_init() != ESP_OK) {
