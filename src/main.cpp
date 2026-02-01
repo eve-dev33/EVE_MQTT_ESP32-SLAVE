@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <SPI.h>
+#include <SPI.h>
 #include <WiFi.h>
 
 #include <WiFiClientSecure.h>
@@ -439,6 +440,7 @@ bool initEspNowRx() {
 
   esp_wifi_start();
 
+  // allinea canale a quello del WiFi
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
@@ -541,7 +543,10 @@ static void sendHello() {
   esp_now_send(BCAST_MAC, (uint8_t*)&h, sizeof(h));
 }
 
+// ================== SETUP / LOOP ==================
 void setup() {
+  randomSeed(esp_random());
+
   randomSeed(esp_random());
 
   Serial.begin(115200);
