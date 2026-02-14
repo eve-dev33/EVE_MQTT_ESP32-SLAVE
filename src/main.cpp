@@ -336,17 +336,23 @@ void applySchedulesIfDue() {
 }
 
 void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
-  if (len == (int)sizeof(HelloPacket)) {
-    HelloPacket h;
-    memcpy(&h, data, sizeof(h));
-    if (h.type == HELLO_TYPE) { gotHello = true; helloCh = h.ch; return; }
+  if (len >= 2) {
+    HelloPacket h{};
+    size_t helloLen = (size_t)len < sizeof(h) ? (size_t)len : sizeof(h);
+    memcpy(&h, data, helloLen);
+    if (h.type == HELLO_TYPE && h.ch >= 1 && h.ch <= 13) {
+      gotHello = true;
+      helloCh = h.ch;
+      return;
+    }
   }
   if (memcmp(mac, C3_MAC, 6) != 0 || len < 1) return;
 
   uint8_t type = data[0];
-  if (type == CMD_TYPE && len == (int)sizeof(CommandPacket)) {
-    CommandPacket cmd;
-    memcpy(&cmd, data, sizeof(cmd));
+  if (type == CMD_TYPE && len >= 5) {
+    CommandPacket cmd{};
+    size_t cmdLen = (size_t)len < sizeof(cmd) ? (size_t)len : sizeof(cmd);
+    memcpy(&cmd, data, cmdLen);
     if (cmd.r1 != CMD_KEEP) setRelayByIndex(1, cmd.r1 == 1);
     if (cmd.r2 != CMD_KEEP) setRelayByIndex(2, cmd.r2 == 1);
     if (cmd.r3 != CMD_KEEP) setRelayByIndex(3, cmd.r3 == 1);
@@ -358,11 +364,15 @@ void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
     return;
   }
 
-  if (type == SCHED_SYNC_TYPE && len == (int)sizeof(ScheduleSyncPacket)) {
-    ScheduleSyncPacket sync;
-    memcpy(&sync, data, sizeof(sync));
+  if (type == SCHED_SYNC_TYPE && len >= 7) {
+    ScheduleSyncPacket sync{};
+    size_t syncLen = (size_t)len < sizeof(sync) ? (size_t)len : sizeof(sync);
+    memcpy(&sync, data, syncLen);
+
     bool ok = true;
     if (sync.relayIdx < 1 || sync.relayIdx > MAX_RELAYS || sync.count > MAX_SCHEDULE_RULES) ok = false;
+    size_t expectedMinLen = 3 + ((size_t)sync.count * sizeof(ScheduleRule));
+    if ((size_t)len < expectedMinLen) ok = false;
     if (!ok) { sendScheduleAck(sync.relayIdx, false, 0); return; }
 
     uint8_t relayPos = sync.relayIdx - 1;
@@ -372,9 +382,10 @@ void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
     return;
   }
 
-  if (type == TIME_SYNC_TYPE && len == (int)sizeof(TimeSyncPacket)) {
-    TimeSyncPacket ts;
-    memcpy(&ts, data, sizeof(ts));
+  if (type == TIME_SYNC_TYPE && len >= 5) {
+    TimeSyncPacket ts{};
+    size_t tsLen = (size_t)len < sizeof(ts) ? (size_t)len : sizeof(ts);
+    memcpy(&ts, data, tsLen);
     if (ts.valid == 1 && ts.weekdayMon0 < 7 && ts.minuteOfDay < 1440) {
       timeValid = true;
       currentMinuteOfDay = ts.minuteOfDay;
