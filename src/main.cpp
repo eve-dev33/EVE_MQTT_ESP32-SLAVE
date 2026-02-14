@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+
 #include <DHT.h>
 #include <SPI.h>
 #include <U8g2lib.h>
@@ -195,7 +196,7 @@ void showSplash(const char* line1, const char* line2 = "", int ms = 0) {
 
 static int readBatteryPercent() {
   uint32_t sum_mv = 0;
-  analogReadMilliVolts(BATT_PIN);
+  analogReadMilliVolts(BATT_PIN); // priming
   for (int i = 0; i < BATT_SAMPLES; i++) {
     sum_mv += analogReadMilliVolts(BATT_PIN);
     delayMicroseconds(200);
@@ -465,7 +466,9 @@ void setup() {
   dht.begin();
   analogReadResolution(ADC_BITS);
   analogSetPinAttenuation(BATT_PIN, ADC_11db);
+  analogSetPinAttenuation(SOIL_PIN, ADC_11db);
   pinMode(BATT_PIN, INPUT);
+  pinMode(SOIL_PIN, INPUT);
 
   pinMode(RELAY1, OUTPUT); pinMode(RELAY2, OUTPUT); pinMode(RELAY3, OUTPUT);
   setRelay(RELAY1, relayState1 == 1);
